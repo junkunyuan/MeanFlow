@@ -181,15 +181,16 @@ def main(args):
     # resume:
     global_step = 0
     if args.resume_step > 0:
-        ckpt_name = str(args.resume_step).zfill(7) +'.pt'
-        ckpt = torch.load(
-            f'{os.path.join(args.output_dir, args.exp_name)}/checkpoints/{ckpt_name}',
-            map_location='cpu',
-            )
-        model.load_state_dict(ckpt['model'])
+        ckpt_name = str(args.resume_step).zfill(7) + '.pt'
+        ckpt_path = f'{os.path.join(args.output_dir, args.exp_name)}/checkpoints/{ckpt_name}'
+        ckpt = torch.load(ckpt_path, map_location='cpu')
+        # 用 unwrap_model 对称加载，prepare 前后都安全
+        accelerator.unwrap_model(model).load_state_dict(ckpt['model'])
         ema.load_state_dict(ckpt['ema'])
         optimizer.load_state_dict(ckpt['opt'])
         global_step = ckpt['steps']
+        if accelerator.is_main_process:
+            logger.info(f"Loaded checkpoint from {ckpt_path} (step={global_step})")
 
     model, optimizer, train_dataloader = accelerator.prepare(
         model, optimizer, train_dataloader
@@ -261,19 +262,27 @@ def main(args):
             
             if accelerator.sync_gradients:
                 progress_bar.update(1)
-                global_step += 1                
-            if global_step % args.checkpointing_steps == 0 and global_step > 0 or global_step >= args.max_train_steps:
-                if accelerator.is_main_process:
-                    checkpoint = {
-                        "model": model.module.state_dict(),
-                        "ema": ema.state_dict(),
-                        "opt": optimizer.state_dict(),
-                        "args": args,
-                        "steps": global_step,
-                    }
-                    checkpoint_path = f"{checkpoint_dir}/{global_step:07d}.pt"
-                    torch.save(checkpoint, checkpoint_path)
-                    logger.info(f"Saved checkpoint to {checkpoint_path}")
+                global_step += 1
+
+                # 只在 sync_gradients 时判断是否保存，避免梯度累积期间重复触发
+                should_save = (
+                    (global_step % args.checkpointing_steps == 0 and global_step > 0)
+                    or global_step >= args.max_train_steps
+                )
+                if should_save:
+                    accelerator.wait_for_everyone()
+                    if accelerator.is_main_process:
+                        checkpoint = {
+                            "model": accelerator.unwrap_model(model).state_dict(),
+                            "ema": ema.state_dict(),
+                            "opt": optimizer.state_dict(),
+                            "args": vars(args),
+                            "steps": global_step,
+                        }
+                        checkpoint_path = f"{checkpoint_dir}/{global_step:07d}.pt"
+                        accelerator.save(checkpoint, checkpoint_path)
+                        logger.info(f"Saved checkpoint to {checkpoint_path}")
+                    accelerator.wait_for_everyone()
             
             logs = {
                 "loss": accelerator.gather(loss_mean).mean().detach().item(), 
