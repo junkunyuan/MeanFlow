@@ -97,10 +97,10 @@ def process_batch(args, vae, device, images, labels, filenames, original_indices
     images = images.to(device)
     
     with torch.no_grad():
-        posterior = DiagonalGaussianDistribution(vae._encode(images))
-        moments = posterior.parameters
-        posterior_flip = DiagonalGaussianDistribution(vae._encode(images.flip(dims=[3])))
-        moments_flip = posterior_flip.parameters
+        # diffusers >=0.29 removed AutoencoderKL._encode; use the public
+        # encode() which wraps the raw moments in DiagonalGaussianDistribution.
+        moments = vae.encode(images).latent_dist.parameters
+        moments_flip = vae.encode(images.flip(dims=[3])).latent_dist.parameters
     
     try:
         with env.begin(write=True) as txn:
