@@ -123,9 +123,8 @@ def main(args):
     )
 
     model = model.to(device)
-    ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
-    requires_grad(ema, False)
-    
+    # NOTE: EMA 在 accelerator.prepare 之后创建，避免各 rank 因 seed 不同而 ema 漂移
+
     # Create loss function with all MeanFlow parameters
     loss_fn = SILoss(
         path_type=args.path_type, 
@@ -173,28 +172,29 @@ def main(args):
         logger.info(f"Dataset contains {len(train_dataset):,} images ({args.data_dir})")
     steps_per_epoch = len(train_dataloader) // accelerator.gradient_accumulation_steps
     args.max_train_steps = args.epochs * steps_per_epoch // accelerator.num_processes
-    # Prepare models for training:
-    update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
     model.train()  # important! This enables embedding dropout for classifier-free guidance
-    ema.eval()  # EMA model should always be in eval mode
-    
+
+    model, optimizer, train_dataloader = accelerator.prepare(
+        model, optimizer, train_dataloader
+    )
+
+    # prepare 后 DDP 已把 rank 0 的权重广播到所有 rank，此时拷贝 EMA 保证各 rank 起点一致
+    ema = deepcopy(accelerator.unwrap_model(model)).to(device)
+    requires_grad(ema, False)
+    ema.eval()
+
     # resume:
     global_step = 0
     if args.resume_step > 0:
         ckpt_name = str(args.resume_step).zfill(7) + '.pt'
         ckpt_path = f'{os.path.join(args.output_dir, args.exp_name)}/checkpoints/{ckpt_name}'
         ckpt = torch.load(ckpt_path, map_location='cpu')
-        # 用 unwrap_model 对称加载，prepare 前后都安全
         accelerator.unwrap_model(model).load_state_dict(ckpt['model'])
         ema.load_state_dict(ckpt['ema'])
         optimizer.load_state_dict(ckpt['opt'])
         global_step = ckpt['steps']
         if accelerator.is_main_process:
             logger.info(f"Loaded checkpoint from {ckpt_path} (step={global_step})")
-
-    model, optimizer, train_dataloader = accelerator.prepare(
-        model, optimizer, train_dataloader
-    )
 
     # 计算 resume 后从哪个 epoch 开始、第一个 epoch 内需要跳过多少 batch
     start_epoch = 0
