@@ -175,13 +175,21 @@ def main(args):
     )
     if accelerator.is_main_process:
         logger.info(f"Dataset contains {len(train_dataset):,} images ({args.data_dir})")
-    steps_per_epoch = len(train_dataloader) // accelerator.gradient_accumulation_steps
-    args.max_train_steps = args.epochs * steps_per_epoch // accelerator.num_processes
     model.train()  # important! This enables embedding dropout for classifier-free guidance
 
     model, optimizer, train_dataloader = accelerator.prepare(
         model, optimizer, train_dataloader
     )
+
+    # prepare 后的 train_dataloader 已经按 num_processes 分片，每个 rank 一个 epoch 的 batch 数
+    steps_per_epoch = max(
+        len(train_dataloader) // accelerator.gradient_accumulation_steps, 1
+    )
+    args.max_train_steps = args.epochs * steps_per_epoch
+    if accelerator.is_main_process:
+        logger.info(
+            f"steps_per_epoch={steps_per_epoch}, max_train_steps={args.max_train_steps}"
+        )
 
     # prepare 后 DDP 已把 rank 0 的权重广播到所有 rank，此时拷贝 EMA 保证各 rank 起点一致
     ema = deepcopy(accelerator.unwrap_model(model)).to(device)
@@ -202,20 +210,14 @@ def main(args):
             logger.info(f"Loaded checkpoint from {ckpt_path} (step={global_step})")
 
     # 计算 resume 后从哪个 epoch 开始、第一个 epoch 内需要跳过多少 batch
-    start_epoch = 0
-    batches_to_skip = 0
-    if args.resume_step > 0:
-        steps_per_epoch_prepared = max(
-            len(train_dataloader) // accelerator.gradient_accumulation_steps, 1
+    start_epoch = global_step // steps_per_epoch
+    steps_in_current_epoch = global_step % steps_per_epoch
+    batches_to_skip = steps_in_current_epoch * accelerator.gradient_accumulation_steps
+    if args.resume_step > 0 and accelerator.is_main_process:
+        logger.info(
+            f"Resuming from global_step={global_step}: "
+            f"start_epoch={start_epoch}, skip {batches_to_skip} batches in first epoch"
         )
-        start_epoch = global_step // steps_per_epoch_prepared
-        steps_in_current_epoch = global_step % steps_per_epoch_prepared
-        batches_to_skip = steps_in_current_epoch * accelerator.gradient_accumulation_steps
-        if accelerator.is_main_process:
-            logger.info(
-                f"Resuming from global_step={global_step}: "
-                f"start_epoch={start_epoch}, skip {batches_to_skip} batches in first epoch"
-            )
 
     progress_bar = tqdm(
         range(0, args.max_train_steps),
@@ -255,7 +257,8 @@ def main(args):
                     
                 ## optimization
                 accelerator.backward(loss)
-                grad_norm = 0.0
+                # 用 tensor 兜底，保证梯度累积期间 accelerator.gather(grad_norm) 也能跑
+                grad_norm = torch.zeros((), device=device)
                 if accelerator.sync_gradients:
                     params_to_clip = model.parameters()
                     grad_norm = accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)

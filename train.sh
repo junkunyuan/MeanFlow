@@ -31,7 +31,7 @@ accelerate launch \
     --resume-step $RESUME_STEP \
     --exp-name "meanflow_l_2" \
     --output-dir "exp" \
-    --data-dir "/opt/tiger/MeanFlow/data_and_model/imagenet_train_latents.lmdb/data.mdb" \
+    --data-dir ${LOCAL_DST} \
     --model "SiT-L/2" \
     --resolution 256 \
     --batch-size 256 \
