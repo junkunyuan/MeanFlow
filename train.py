@@ -292,16 +292,16 @@ def main(args):
                         logger.info(f"Saved checkpoint to {checkpoint_path}")
                     accelerator.wait_for_everyone()
             
-            logs = {
-                "loss": accelerator.gather(loss_mean).mean().detach().item(), 
-                "loss_ref": accelerator.gather(loss_mean_ref).mean().detach().item(), 
-                "grad_norm": accelerator.gather(grad_norm).mean().detach().item()
-            }
-            progress_bar.set_postfix(**logs)
-            
-            # Log to file periodically
-            if accelerator.is_main_process and global_step % 100 == 0:
-                logger.info(f"Step {global_step}: loss = {logs['loss']:.4f}, grad_norm = {logs['grad_norm']:.4f}")
+            # 只在 log 节奏上 gather + .item()，避免每步 GPU↔CPU 同步和多机通信开销
+            if accelerator.sync_gradients and global_step % 100 == 0:
+                logs = {
+                    "loss": accelerator.gather(loss_mean).mean().item(),
+                    "loss_ref": accelerator.gather(loss_mean_ref).mean().item(),
+                    "grad_norm": accelerator.gather(grad_norm).mean().item(),
+                }
+                progress_bar.set_postfix(**logs)
+                if accelerator.is_main_process:
+                    logger.info(f"Step {global_step}: loss = {logs['loss']:.4f}, grad_norm = {logs['grad_norm']:.4f}")
 
             if global_step >= args.max_train_steps:
                 break

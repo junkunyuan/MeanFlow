@@ -170,7 +170,7 @@ class SILoss:
                 # Compute JVP with CFG velocity
                 def fn_current_cfg(z, cur_r, cur_t):
                     return model(z, cur_r, cur_t, **cfg_kwargs)
-                
+
                 primals = (cfg_z_t, cfg_r, cfg_t)
                 tangents = (cfg_v_tilde, torch.zeros_like(cfg_r), torch.ones_like(cfg_t))
                 _, cfg_dudt = jvp(fn_current_cfg, primals,tangents)
@@ -195,7 +195,7 @@ class SILoss:
                 
                 def fn_current_no_cfg(z, cur_r, cur_t):
                     return model(z, cur_r, cur_t, **no_cfg_kwargs)
-                
+
                 primals = (no_cfg_z_t, no_cfg_r, no_cfg_t)
                 tangents = (no_cfg_v_t, torch.zeros_like(no_cfg_r), torch.ones_like(no_cfg_t))
                 _, no_cfg_dudt = jvp(fn_current_no_cfg,primals,tangents)

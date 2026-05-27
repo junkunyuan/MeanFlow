@@ -1,3 +1,6 @@
 data_MeanFlow*
 log_*.txt
 *.mdb
+__pycache__/
+*.md
+exp/

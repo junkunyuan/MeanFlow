@@ -10,11 +10,13 @@ else
   echo "完成ImageNet拷贝"
 fi
 
+pip install lmdb
+
 NNODES=$ARNOLD_NUM
 NODE_RANK=$ARNOLD_ID
 NPROC_PER_NODE=$ARNOLD_WORKER_GPU
 MASTER_ADDRESS=$ARNOLD_WORKER_0_HOST
-MASTER_PORT=$PORT0
+MASTER_PORT=9659   # PORT0 被 sshd 占用，改用 PORT1
 NUM_PROCESSES=$((NNODES * NPROC_PER_NODE))
 
 # 要恢复训练就设置为对应的 step（例如 RESUME_STEP=10000），从头训练保持 0
@@ -49,4 +51,4 @@ accelerate launch \
     --cfg-kappa 0.92 \
     --cfg-min-t 0.0 \
     --cfg-max-t 0.8 \
-    --checkpointing-steps 10000
+    --checkpointing-steps 50000
