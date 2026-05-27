@@ -194,7 +194,23 @@ def main(args):
     model, optimizer, train_dataloader = accelerator.prepare(
         model, optimizer, train_dataloader
     )
-        
+
+    # 计算 resume 后从哪个 epoch 开始、第一个 epoch 内需要跳过多少 batch
+    start_epoch = 0
+    batches_to_skip = 0
+    if args.resume_step > 0:
+        steps_per_epoch_prepared = max(
+            len(train_dataloader) // accelerator.gradient_accumulation_steps, 1
+        )
+        start_epoch = global_step // steps_per_epoch_prepared
+        steps_in_current_epoch = global_step % steps_per_epoch_prepared
+        batches_to_skip = steps_in_current_epoch * accelerator.gradient_accumulation_steps
+        if accelerator.is_main_process:
+            logger.info(
+                f"Resuming from global_step={global_step}: "
+                f"start_epoch={start_epoch}, skip {batches_to_skip} batches in first epoch"
+            )
+
     progress_bar = tqdm(
         range(0, args.max_train_steps),
         initial=global_step,
@@ -209,9 +225,13 @@ def main(args):
     latents_bias = torch.tensor(
         [0., 0., 0., 0.]
         ).view(1, 4, 1, 1).to(device)
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         model.train()
-        for moments, labels in train_dataloader:
+        if epoch == start_epoch and batches_to_skip > 0:
+            active_dataloader = accelerator.skip_first_batches(train_dataloader, batches_to_skip)
+        else:
+            active_dataloader = train_dataloader
+        for moments, labels in active_dataloader:
             moments = moments.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
