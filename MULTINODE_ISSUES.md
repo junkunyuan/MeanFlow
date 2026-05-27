@@ -2,32 +2,6 @@
 
 ## 🟡 中等问题
 
-### 4. EMA 初始化时机错位，rank 间会漂移
-
-**位置**：`train.py:177`
-
-```python
-update_ema(ema, model, decay=0)  # ⚠️ 在 accelerator.prepare 之前
-model, optimizer, train_dataloader = accelerator.prepare(...)
-```
-
-**问题**：
-- 每个 rank 因为 `set_seed(seed + process_index)`（train.py:106）用**不同种子**初始化了 model。
-- `ema = deepcopy(model)` 拷贝的是各 rank 不同的 model 权重。
-- `prepare` 后 DDP 把 rank 0 的 model 广播给所有 rank，**但 ema 不在 DDP 里**，仍然是各 rank 不同。
-- 之后每步 `update_ema` 用相同的 model param 叠加在不同的 ema 上，ema 会**持续在 rank 间漂移**。
-- 只有 rank 0 的 ema 被保存到 ckpt，所以保存本身没问题；但如果用 ema 做分布式推理/评估，各 rank 结果会不一致。
-
-**修复建议**：把 ema 初始化放到 `accelerator.prepare` 之后：
-
-```python
-model, optimizer, train_dataloader = accelerator.prepare(model, optimizer, train_dataloader)
-ema = deepcopy(accelerator.unwrap_model(model)).to(device)
-requires_grad(ema, False)
-```
-
----
-
 ### 5. 每个 process 用不同 seed 初始化模型
 
 **位置**：`train.py:106`

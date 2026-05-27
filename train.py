@@ -102,13 +102,14 @@ def main(args):
     device = accelerator.device
     if torch.backends.mps.is_available():
         accelerator.native_amp = False    
+    # 用统一 seed 创建 model，保证各 rank 的随机初始化一致（不再依赖 DDP 隐式广播兜底）
     if args.seed is not None:
-        set_seed(args.seed + accelerator.process_index)
-    
+        set_seed(args.seed)
+
     # Create model:
     assert args.resolution % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     latent_size = args.resolution // 8
-    
+
     # Define block_kwargs from args
     block_kwargs = {
         "fused_attn": False,
@@ -124,6 +125,10 @@ def main(args):
 
     model = model.to(device)
     # NOTE: EMA 在 accelerator.prepare 之后创建，避免各 rank 因 seed 不同而 ema 漂移
+
+    # model 建好后再切到 rank-specific seed，让 DataLoader / 数据增强在各 rank 拿到不同序列
+    if args.seed is not None:
+        set_seed(args.seed + accelerator.process_index)
 
     # Create loss function with all MeanFlow parameters
     loss_fn = SILoss(
