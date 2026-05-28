@@ -1,4 +1,5 @@
 import os
+import glob
 import argparse
 import json
 import numpy as np
@@ -10,9 +11,60 @@ import torch
 import torch.distributed as dist
 from diffusers.models import AutoencoderKL
 import torch_fidelity
+from torch_fidelity.feature_extractor_inceptionv3 import FeatureExtractorInceptionV3
+from torch_fidelity.metric_fid import (
+    fid_features_to_statistics,
+    fid_statistics_to_metric,
+)
+from torch_fidelity.metric_isc import isc_features_to_metric
 
 from sit import SiT_models
 from meanflow_sampler import meanflow_sampler
+
+
+def compute_metrics_with_cached_stats(img_folder, fid_stats_file, device, batch_size=64):
+    """FID (vs. precomputed reference stats) + IS on images in `img_folder`.
+
+    Works around `torch_fidelity.calculate_metrics` not accepting
+    `fid_statistics_file=` in the installed version: we run the same
+    Inception-v3 feature extractor directly and feed its outputs into
+    torch_fidelity's stats-level helpers.
+    """
+    img_paths = sorted(glob.glob(os.path.join(img_folder, "*.png")))
+    assert img_paths, f"No PNGs found in {img_folder}"
+
+    fe = FeatureExtractorInceptionV3(
+        "inception-v3-compat", ["2048", "logits_unbiased"]
+    ).to(device).eval()
+
+    feats_2048, feats_logits = [], []
+    with torch.no_grad():
+        for i in tqdm(range(0, len(img_paths), batch_size), desc="Inception features"):
+            chunk = img_paths[i: i + batch_size]
+            arr = np.stack([np.asarray(Image.open(p).convert("RGB")) for p in chunk])
+            x = torch.from_numpy(arr).permute(0, 3, 1, 2).contiguous().to(
+                device, dtype=torch.uint8
+            )
+            f2048, flogits = fe(x)
+            feats_2048.append(f2048.cpu())
+            feats_logits.append(flogits.cpu())
+
+    feats_2048 = torch.cat(feats_2048, dim=0)
+    feats_logits = torch.cat(feats_logits, dim=0)
+
+    is_dict = isc_features_to_metric(feats_logits)
+
+    stats_gen = fid_features_to_statistics(feats_2048)
+    ref = np.load(fid_stats_file)
+    # The reference .npz is float64; cast generated stats to match (mu defaults
+    # to float32 because Inception features are float32).
+    stats_gen = {"mu": stats_gen["mu"].astype(np.float64),
+                 "sigma": stats_gen["sigma"].astype(np.float64)}
+    stats_ref = {"mu": ref["mu"].astype(np.float64),
+                 "sigma": ref["sigma"].astype(np.float64)}
+    fid_dict = fid_statistics_to_metric(stats_gen, stats_ref, verbose=True)
+
+    return {**is_dict, **fid_dict}
 
 
 def main(args):
@@ -74,63 +126,63 @@ def main(args):
     samples_needed_this_gpu = int(total_samples // dist.get_world_size())
     assert samples_needed_this_gpu % n == 0, "samples_needed_this_gpu must be divisible by the per-GPU batch size"
     iterations = int(samples_needed_this_gpu // n)
-    pbar = range(iterations)
-    pbar = tqdm(pbar) if rank == 0 else pbar
-    total = 0
-    
-    for _ in pbar:
-        z = torch.randn(n, model.in_channels, latent_size, latent_size, device=device)
-        y = torch.randint(0, args.num_classes, (n,), device=device)
 
-        # Sample images using MeanFlow:
-        with torch.no_grad():
-            samples = meanflow_sampler(
-                model=model, 
-                latents=z,
-                y=y,
-                cfg_scale=args.cfg_scale,
-                num_steps=args.num_steps,
-            ).to(torch.float32)
-            latents_scale = torch.tensor(
-                [0.18125, 0.18125, 0.18125, 0.18125]
+    # Skip sampling entirely if a previous run already produced every image
+    # (e.g. sampling succeeded but metric computation crashed).
+    existing = len(glob.glob(os.path.join(img_folder, "*.png")))
+    if existing >= total_samples:
+        if rank == 0:
+            print(f"[skip-sample] {existing} images already exist in {img_folder}")
+    else:
+        if rank == 0 and existing > 0:
+            print(f"[resample] only {existing}/{total_samples} found — resampling all")
+        pbar = tqdm(range(iterations)) if rank == 0 else range(iterations)
+        total = 0
+        for _ in pbar:
+            z = torch.randn(n, model.in_channels, latent_size, latent_size, device=device)
+            y = torch.randint(0, args.num_classes, (n,), device=device)
+
+            with torch.no_grad():
+                samples = meanflow_sampler(
+                    model=model,
+                    latents=z,
+                    y=y,
+                    cfg_scale=args.cfg_scale,
+                    num_steps=args.num_steps,
+                ).to(torch.float32)
+                latents_scale = torch.tensor(
+                    [0.18125, 0.18125, 0.18125, 0.18125]
                 ).view(1, 4, 1, 1).to(device)
-            latents_bias = torch.tensor(
-                [0., 0., 0., 0.]
+                latents_bias = torch.tensor(
+                    [0., 0., 0., 0.]
                 ).view(1, 4, 1, 1).to(device)
-            samples = vae.decode((samples -  latents_bias) / latents_scale).sample
-            samples = (samples + 1) / 2.
-            samples = torch.clamp(
-                255. * samples, 0, 255
+                samples = vae.decode((samples - latents_bias) / latents_scale).sample
+                samples = (samples + 1) / 2.
+                samples = torch.clamp(
+                    255. * samples, 0, 255
                 ).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
 
-            for i, sample in enumerate(samples):
-                index = i * dist.get_world_size() + rank + total
-                Image.fromarray(sample).save(f"{eval_fid_dir}/img_dir/{index:06d}.png")
-        total += global_batch_size
+                for i, sample in enumerate(samples):
+                    index = i * dist.get_world_size() + rank + total
+                    Image.fromarray(sample).save(f"{eval_fid_dir}/img_dir/{index:06d}.png")
+            total += global_batch_size
 
     dist.barrier()
     
     # Calculate FID and IS metrics (only on rank 0)
     if rank == 0 and args.compute_metrics:
         print(f"Computing evaluation metrics...")
-        
-        metrics_dict = {}
-        metrics_args = {
-            'input1': img_folder,
-            'cuda': True,
-            'isc': True,
-            'fid': True,
-            'kid': False,
-            'prc': False,
-            'verbose': True,
-        }
-        if args.resolution == 256:
-            metrics_args['input2'] = None
-            metrics_args['fid_statistics_file'] = args.fid_statistics_file
-        else:
-            raise NotImplementedError
 
-        metrics_dict = torch_fidelity.calculate_metrics(**metrics_args)
+        if args.resolution != 256:
+            raise NotImplementedError
+        assert args.fid_statistics_file and os.path.exists(args.fid_statistics_file), \
+            f"FID stats file not found: {args.fid_statistics_file}"
+
+        metrics_dict = compute_metrics_with_cached_stats(
+            img_folder=img_folder,
+            fid_stats_file=args.fid_statistics_file,
+            device=device,
+        )
         
         fid = metrics_dict.get('frechet_inception_distance', None)
         is_mean = metrics_dict.get('inception_score_mean', None)
